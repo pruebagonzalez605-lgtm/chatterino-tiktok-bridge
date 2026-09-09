@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: chatterino-tiktok-bridge
+    runtime: node
+    rootDir: chat-bridge
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: CHAT_BRIDGE_TOKEN
+        generateValue: true
