@@ -1,10 +1,11 @@
-services:
+﻿services:
   - type: web
-    name: chatterino-tiktok-bridge
+    name: chatterino-bridge
     runtime: node
-    rootDir: chat-bridge
-    buildCommand: npm install
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: CHAT_BRIDGE_TOKEN
         generateValue: true

@@ -1,12 +1,23 @@
 const http = require("node:http");
 const { URL } = require("node:url");
-const { TikTokLiveConnection, WebcastEvent } = require("tiktok-live-connector");
+const {
+  TikTokLiveConnection,
+  WebcastEvent,
+  ControlEvent,
+} = require("tiktok-live-connector");
 const { LiveChat } = require("youtube-chat");
 
-const PORT = Number(process.env.CHAT_BRIDGE_PORT || 17427);
+const PORT = Number(process.env.PORT || process.env.CHAT_BRIDGE_PORT || 17427);
 const HOST = process.env.CHAT_BRIDGE_HOST || "0.0.0.0";
 const BRIDGE_TOKEN = String(process.env.CHAT_BRIDGE_TOKEN || "").trim();
 const MAX_BUFFER = 500;
+const MAX_SEEN_MESSAGE_IDS = 5000;
+const RETRY_MIN_MS = 2500;
+const RETRY_MAX_MS = 120000;
+const OFFLINE_RETRY_MS = 60000;
+const TIKTOK_CONNECT_TIMEOUT_MS = 30000;
+const TIKTOK_STALE_AFTER_MS = 150000;
+const STREAM_IDLE_TTL_MS = 15 * 60 * 1000;
 const streams = new Map();
 
 process.on("unhandledRejection", (error) => {
@@ -38,25 +49,28 @@ function getStream(platform, channel) {
       error: "",
       connection: null,
       retryAfter: 0,
+      retryTimer: null,
+      connectTimeoutTimer: null,
+      watchdogTimer: null,
+      reconnectAttempt: 0,
+      generation: 0,
+      lastActivityAt: 0,
+      lastPollAt: Date.now(),
+      seenMessageIds: new Set(),
     };
     streams.set(key, stream);
   }
 
+  stream.lastPollAt = Date.now();
+
   if (
-    platform === "tiktok" &&
     !stream.connected &&
     !stream.connecting &&
-    Date.now() >= (stream.retryAfter || 0)
+    !stream.retryTimer &&
+    Date.now() >= stream.retryAfter
   ) {
-    connectTikTok(stream);
-  }
-  if (
-    platform === "youtube" &&
-    !stream.connected &&
-    !stream.connecting &&
-    Date.now() >= (stream.retryAfter || 0)
-  ) {
-    connectYouTube(stream);
+    if (platform === "tiktok") connectTikTok(stream);
+    if (platform === "youtube") connectYouTube(stream);
   }
 
   return stream;
@@ -68,10 +82,23 @@ function pushMessage(stream, user, text, id, type = "chat") {
     return;
   }
 
+  const messageId = id ? String(id) : `${stream.channel}-${stream.seq + 1}`;
+  // TikTok may replay recent events after a reconnect. Do not show the same
+  // chat or activity event twice, while keeping connection status visible.
+  if (type !== "status" && stream.seenMessageIds.has(messageId)) {
+    return;
+  }
+  if (type !== "status") {
+    stream.seenMessageIds.add(messageId);
+    if (stream.seenMessageIds.size > MAX_SEEN_MESSAGE_IDS) {
+      stream.seenMessageIds.delete(stream.seenMessageIds.values().next().value);
+    }
+  }
+
   stream.seq += 1;
   stream.messages.push({
     seq: stream.seq,
-    id: id ? String(id) : `${stream.channel}-${stream.seq}`,
+    id: messageId,
     type,
     user: String(user || stream.platform),
     text: cleanText,
@@ -81,6 +108,95 @@ function pushMessage(stream, user, text, id, type = "chat") {
   if (stream.messages.length > MAX_BUFFER) {
     stream.messages.splice(0, stream.messages.length - MAX_BUFFER);
   }
+}
+
+function errorText(error) {
+  return error && error.message ? error.message : String(error || "Unknown error");
+}
+
+function isCurrent(stream, connection, generation) {
+  return stream.connection === connection && stream.generation === generation;
+}
+
+function stopTimer(stream, name) {
+  if (stream[name]) {
+    clearTimeout(stream[name]);
+    stream[name] = null;
+  }
+}
+
+function closeConnection(connection) {
+  try {
+    const closeResult = connection?.disconnect?.();
+    if (closeResult?.catch) closeResult.catch(() => {});
+  } catch {
+    // It is already closed or the connector rejected a duplicate disconnect.
+  }
+}
+
+function retryDelay(stream, offline = false) {
+  if (offline) return OFFLINE_RETRY_MS;
+  const exponential = Math.min(
+    RETRY_MAX_MS,
+    RETRY_MIN_MS * 2 ** Math.min(stream.reconnectAttempt, 6),
+  );
+  return Math.round(exponential * (0.8 + Math.random() * 0.4));
+}
+
+function scheduleReconnect(stream, reason, { offline = false } = {}) {
+  if (stream.platform !== "tiktok") return;
+  // An error often triggers a following disconnected event. The first retry
+  // wins so those two notifications don't multiply the backoff delay.
+  if (stream.retryTimer) return;
+  stopTimer(stream, "connectTimeoutTimer");
+  stopTimer(stream, "watchdogTimer");
+  // Retire the previous connection before retrying. A few network failures
+  // leave connect() pending forever; its late events must not revive it.
+  const previousConnection = stream.connection;
+  stream.generation += 1;
+  stream.connection = null;
+  closeConnection(previousConnection);
+  stream.connected = false;
+  stream.connecting = false;
+  stream.error = reason;
+  stream.reconnectAttempt += 1;
+  const delay = retryDelay(stream, offline);
+  stream.retryAfter = Date.now() + delay;
+  stream.retryTimer = setTimeout(() => {
+    stream.retryTimer = null;
+    if (!stream.connected && !stream.connecting) connectTikTok(stream);
+  }, delay);
+}
+
+function armTikTokWatchdog(stream, connection, generation) {
+  stopTimer(stream, "watchdogTimer");
+  const check = () => {
+    if (!isCurrent(stream, connection, generation) || !stream.connected) return;
+    if (Date.now() - stream.lastActivityAt >= TIKTOK_STALE_AFTER_MS) {
+      closeConnection(connection);
+      scheduleReconnect(stream, "TikTok connection became stale; reconnecting.");
+      return;
+    }
+    stream.watchdogTimer = setTimeout(check, TIKTOK_STALE_AFTER_MS);
+  };
+  stream.watchdogTimer = setTimeout(check, TIKTOK_STALE_AFTER_MS);
+}
+
+function disposeStream(stream) {
+  stopTimer(stream, "retryTimer");
+  stopTimer(stream, "connectTimeoutTimer");
+  stopTimer(stream, "watchdogTimer");
+  stream.generation += 1;
+  stream.connected = false;
+  stream.connecting = false;
+  closeConnection(stream.connection);
+  try {
+    const stopResult = stream.connection?.stop?.();
+    if (stopResult?.catch) stopResult.catch(() => {});
+  } catch {
+    // The source is already stopped.
+  }
+  stream.connection = null;
 }
 
 function pickUser(data) {
@@ -108,23 +224,44 @@ function pickText(data) {
 }
 
 async function connectTikTok(stream) {
+  stopTimer(stream, "retryTimer");
+  stopTimer(stream, "connectTimeoutTimer");
+  stopTimer(stream, "watchdogTimer");
   stream.connecting = true;
   stream.error = "";
+  const generation = ++stream.generation;
   const connection = new TikTokLiveConnection(stream.channel, {
     processInitialData: false,
     enableExtendedGiftInfo: false,
   });
   stream.connection = connection;
 
+  // Some networks or TikTok edge servers keep the initial request open
+  // without emitting an error. Turn that into a visible retry instead of
+  // leaving the channel in "connecting" indefinitely.
+  stream.connectTimeoutTimer = setTimeout(() => {
+    if (!isCurrent(stream, connection, generation) || !stream.connecting) return;
+    scheduleReconnect(
+      stream,
+      `TikTok connection timed out after ${Math.round(TIKTOK_CONNECT_TIMEOUT_MS / 1000)} seconds; retrying.`,
+    );
+  }, TIKTOK_CONNECT_TIMEOUT_MS);
+
   connection.on(WebcastEvent.CHAT, (data) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
     pushMessage(stream, pickUser(data), pickText(data), data?.msgId || data?.id, "chat");
   });
 
   connection.on(WebcastEvent.MEMBER, (data) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
     pushMessage(stream, "TikTok", `${pickUser(data)} se unio`, data?.msgId || data?.id, "event");
   });
 
   connection.on(WebcastEvent.SOCIAL, (data) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
     const label = data?.label || data?.socialTypeName || pickText(data);
     if (label) {
       pushMessage(stream, "TikTok", `${pickUser(data)} ${label}`, data?.msgId || data?.id, "event");
@@ -132,40 +269,82 @@ async function connectTikTok(stream) {
   });
 
   connection.on(WebcastEvent.GIFT, (data) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
     const giftName = data?.giftName || data?.gift?.name || "regalo";
     pushMessage(stream, "TikTok", `${pickUser(data)} envio ${giftName}`, data?.msgId || data?.id, "event");
   });
 
   connection.on(WebcastEvent.LIKE, (data) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
     const count = data?.likeCount || data?.count;
     if (count) {
       pushMessage(stream, "TikTok", `${pickUser(data)} dio ${count} likes`, data?.msgId || data?.id, "event");
     }
   });
 
-  connection.on(WebcastEvent.DISCONNECTED || "disconnected", () => {
-    stream.connected = false;
-    stream.connecting = false;
-    stream.error = "TikTok disconnected; reconnecting on next poll.";
+  connection.on(ControlEvent.CONNECTED, () => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
+  });
+
+  connection.on(ControlEvent.WEBSOCKET_DATA, () => {
+    if (!isCurrent(stream, connection, generation)) return;
+    stream.lastActivityAt = Date.now();
+  });
+
+  connection.on(ControlEvent.ERROR, (error) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    closeConnection(connection);
+    scheduleReconnect(stream, `TikTok error: ${errorText(error?.exception || error)}`);
+  });
+
+  connection.on(ControlEvent.DISCONNECTED, ({ code, reason } = {}) => {
+    if (!isCurrent(stream, connection, generation)) return;
+    const detail = reason ? `: ${reason}` : code ? ` (code ${code})` : "";
+    scheduleReconnect(stream, `TikTok disconnected${detail}; reconnecting.`);
   });
 
   connection.on(WebcastEvent.STREAM_END, () => {
-    stream.connected = false;
-    stream.connecting = false;
-    stream.error = "TikTok live ended or is offline.";
+    if (!isCurrent(stream, connection, generation)) return;
+    closeConnection(connection);
+    scheduleReconnect(stream, "TikTok live ended or is offline. Retrying shortly.", {
+      offline: true,
+    });
   });
 
   try {
     await connection.connect();
+    if (!isCurrent(stream, connection, generation)) {
+      closeConnection(connection);
+      return;
+    }
+    stopTimer(stream, "connectTimeoutTimer");
     stream.connected = true;
-    stream.error = "";
-    pushMessage(stream, "TikTok", `Connected to @${stream.channel}.`, "connected", "status");
-  } catch (error) {
-    stream.connected = false;
-    stream.error = error && error.message ? error.message : String(error);
-    stream.retryAfter = Date.now() + 15000;
-  } finally {
     stream.connecting = false;
+    stream.reconnectAttempt = 0;
+    stream.retryAfter = 0;
+    stream.lastActivityAt = Date.now();
+    stream.error = "";
+    armTikTokWatchdog(stream, connection, generation);
+    pushMessage(
+      stream,
+      "TikTok",
+      `Connected to @${stream.channel}.`,
+      `connected-${generation}`,
+      "status",
+    );
+  } catch (error) {
+    if (isCurrent(stream, connection, generation)) {
+      closeConnection(connection);
+      scheduleReconnect(stream, `TikTok connection failed: ${errorText(error)}`);
+    }
+  } finally {
+    if (isCurrent(stream, connection, generation)) {
+      stopTimer(stream, "connectTimeoutTimer");
+      stream.connecting = false;
+    }
   }
 }
 
@@ -320,13 +499,13 @@ function json(res, status, payload) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
 
-  if (BRIDGE_TOKEN && req.headers.authorization !== `Bearer ${BRIDGE_TOKEN}`) {
-    json(res, 401, { ok: false, error: "Unauthorized" });
+  if (url.pathname === "/health") {
+    json(res, 200, { ok: true });
     return;
   }
 
-  if (url.pathname === "/health") {
-    json(res, 200, { ok: true });
+  if (BRIDGE_TOKEN && req.headers.authorization !== `Bearer ${BRIDGE_TOKEN}`) {
+    json(res, 401, { ok: false, error: "Unauthorized" });
     return;
   }
 
@@ -376,10 +555,33 @@ const server = http.createServer((req, res) => {
     connected: stream.connected,
     connecting: stream.connecting,
     error: stream.error,
+    reconnectAttempt: stream.reconnectAttempt,
+    retryInMs: Math.max(0, (stream.retryAfter || 0) - Date.now()),
+    lastActivityAt: stream.lastActivityAt || null,
     latestSeq: stream.seq,
     messages: stream.messages.filter((message) => message.seq > since),
   });
 });
+
+const cleanupTimer = setInterval(() => {
+  const cutoff = Date.now() - STREAM_IDLE_TTL_MS;
+  for (const [key, stream] of streams) {
+    if (stream.lastPollAt < cutoff) {
+      disposeStream(stream);
+      streams.delete(key);
+    }
+  }
+}, 60000);
+
+function shutdown() {
+  clearInterval(cleanupTimer);
+  for (const stream of streams.values()) disposeStream(stream);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
 
 server.listen(PORT, HOST, () => {
   console.log(`Chat bridge listening on http://${HOST}:${PORT}`);
