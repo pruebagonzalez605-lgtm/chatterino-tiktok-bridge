@@ -76,7 +76,7 @@ function getStream(platform, channel) {
   return stream;
 }
 
-function pushMessage(stream, user, text, id, type = "chat") {
+function pushMessage(stream, user, text, id, type = "chat", kind = "") {
   const cleanText = String(text || "").trim();
   if (!cleanText) {
     return;
@@ -102,6 +102,7 @@ function pushMessage(stream, user, text, id, type = "chat") {
     type,
     user: String(user || stream.platform),
     text: cleanText,
+    kind: kind || type,
     ts: Date.now(),
   });
 
@@ -256,7 +257,7 @@ async function connectTikTok(stream) {
   connection.on(WebcastEvent.MEMBER, (data) => {
     if (!isCurrent(stream, connection, generation)) return;
     stream.lastActivityAt = Date.now();
-    pushMessage(stream, "TikTok", `${pickUser(data)} se unio`, data?.msgId || data?.id, "event");
+    pushMessage(stream, "TikTok", `${pickUser(data)} se unio`, data?.msgId || data?.id, "event", "member");
   });
 
   connection.on(WebcastEvent.SOCIAL, (data) => {
@@ -264,7 +265,7 @@ async function connectTikTok(stream) {
     stream.lastActivityAt = Date.now();
     const label = data?.label || data?.socialTypeName || pickText(data);
     if (label) {
-      pushMessage(stream, "TikTok", `${pickUser(data)} ${label}`, data?.msgId || data?.id, "event");
+      pushMessage(stream, "TikTok", `${pickUser(data)} ${label}`, data?.msgId || data?.id, "event", "social");
     }
   });
 
@@ -272,7 +273,7 @@ async function connectTikTok(stream) {
     if (!isCurrent(stream, connection, generation)) return;
     stream.lastActivityAt = Date.now();
     const giftName = data?.giftName || data?.gift?.name || "regalo";
-    pushMessage(stream, "TikTok", `${pickUser(data)} envio ${giftName}`, data?.msgId || data?.id, "event");
+    pushMessage(stream, "TikTok", `${pickUser(data)} envio ${giftName}`, data?.msgId || data?.id, "event", "gift");
   });
 
   connection.on(WebcastEvent.LIKE, (data) => {
@@ -280,7 +281,7 @@ async function connectTikTok(stream) {
     stream.lastActivityAt = Date.now();
     const count = data?.likeCount || data?.count;
     if (count) {
-      pushMessage(stream, "TikTok", `${pickUser(data)} dio ${count} likes`, data?.msgId || data?.id, "event");
+      pushMessage(stream, "TikTok", `${pickUser(data)} dio ${count} likes`, data?.msgId || data?.id, "event", "like");
     }
   });
 
@@ -499,8 +500,10 @@ function json(res, status, payload) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
 
+  // /health stays public so clients can tell "asleep/unreachable" apart
+  // from "needs a token"; it exposes no chat data.
   if (url.pathname === "/health") {
-    json(res, 200, { ok: true });
+    json(res, 200, { ok: true, tokenRequired: Boolean(BRIDGE_TOKEN) });
     return;
   }
 
